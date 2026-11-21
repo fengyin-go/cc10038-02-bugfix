@@ -32,6 +32,7 @@ class DedupPayload(BaseModel):
     dedup_key_fields: list[str] = Field(..., min_length=1)
     window: str = "batch"
     retain_strategy: str = "keep_first"
+    batch_no: str | None = None
 
 
 class AggregationPayload(BaseModel):
@@ -39,6 +40,7 @@ class AggregationPayload(BaseModel):
     dim_field: str = Field(..., min_length=1)
     metric_field: str = "count"
     agg_func: str = "count"
+    batch_no: str | None = None
 
 
 class ExportPayload(BaseModel):
@@ -99,7 +101,9 @@ def pipeline_recover_batch(batch_no: str = Query(..., min_length=1)) -> dict[str
 
 @router.post("/dedup/run")
 def pipeline_run_dedup(payload: DedupPayload) -> dict[str, Any]:
-    return pipeline.run_dedup(payload.dedup_key_fields, payload.window, payload.retain_strategy)
+    return pipeline.run_dedup(
+        payload.dedup_key_fields, payload.window, payload.retain_strategy, payload.batch_no
+    )
 
 
 @router.post("/validate")
@@ -110,7 +114,11 @@ def pipeline_validate_entities(batch_no: str | None = Query(default=None)) -> di
 @router.post("/aggregation/refresh")
 def pipeline_refresh_aggregation(payload: AggregationPayload) -> dict[str, Any]:
     return pipeline.refresh_aggregation(
-        payload.view_name, payload.dim_field, payload.metric_field, payload.agg_func
+        payload.view_name,
+        payload.dim_field,
+        payload.metric_field,
+        payload.agg_func,
+        payload.batch_no,
     )
 
 

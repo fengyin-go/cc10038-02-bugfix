@@ -517,6 +517,7 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
   '指标定义': '聚合查询视图样例3',
   '数据源范围': '聚合查询视图样例3',
   '刷新间隔': '聚合查询视图样例3'}],
+    "dedup_detail": [],
     "data_lineage": [{'id': 1,
   'status': '已记录',
   'pending': True,

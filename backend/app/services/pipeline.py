@@ -7,10 +7,28 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
 import time
 from typing import Any
 
 from app.store import store
+
+# 去重改写与聚合刷新共用同一把锁：保证一次去重判定的写入和一次聚合读取
+# 彼此串行，已发布的聚合结果不会混入两次判定的中间状态。
+_PIPELINE_LOCK = threading.RLock()
+
+# 去重明细表名（仅在内存仓库中使用，不进入前端业务模块清单）。
+DEDUP_DETAIL_TABLE = "dedup_detail"
+GLOBAL_DEDUP_SCOPE = "global"
+# 明细判定结果取值。
+VERDICT_RETAIN = "保留"
+VERDICT_ELIMINATED = "淘汰"
+VERDICT_RESTORED = "恢复"
+# 去重运行与聚合视图的状态取值。
+RUN_RUNNING = "运行中"
+RUN_COMPLETED = "已完成"
+VIEW_CONSUMABLE = "可消费"
+VIEW_CANDIDATE = "候选中"
 
 
 def _now_iso() -> str:
@@ -24,6 +42,62 @@ def _stable_digest(data: dict[str, Any]) -> str:
 
 def _next_id(module: str) -> int:
     return max((int(r.get("id", 0)) for r in store.rows(module)), default=0) + 1
+
+
+def _load_fields(entity: dict[str, Any]) -> dict[str, Any]:
+    """安全读取标准化明细中的字段集。"""
+    try:
+        data = json.loads(entity.get("标准化字段集", "{}"))
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _dedup_key(entity: dict[str, Any], key_fields: list[str]) -> str:
+    fields_data = _load_fields(entity)
+    return "||".join(str(fields_data.get(k, "")) for k in key_fields)
+
+
+def _dedup_scopes(window: str) -> list[str]:
+    """按窗口枚举去重判定范围。
+
+    batch 窗口沿用批次取数逻辑：每条合格明细按自身批次进入独立范围，
+    两个批次的同键日志落在不同范围、各自保留一条，互不淘汰。
+    已经出过判定结果的批次即使当前记录全被淘汰，也要继续纳入，保证重跑
+    （如切换保留策略）时能恢复被置换的记录。
+    其它窗口（如 global）维持全局同一判定范围。
+    """
+    if str(window).strip().lower() == "batch":
+        batches = {
+            str(rec.get("来源批次") or "")
+            for rec in store.rows("parsed_entity")
+            if rec.get("status") == "校验通过"
+        }
+        batches |= {
+            str(d.get("批次编号") or "")
+            for d in store.rows(DEDUP_DETAIL_TABLE)
+            if d.get("run_status") == RUN_COMPLETED and d.get("批次编号")
+        }
+        return sorted(b for b in batches if b)
+    return [GLOBAL_DEDUP_SCOPE]
+
+
+def _dedup_runs_for_scope(scope: str) -> list[dict[str, Any]]:
+    """返回某判定范围下的去重明细（含历史各轮，按 run 与 id 排序）。"""
+    details = store.rows(DEDUP_DETAIL_TABLE)
+    rows = [d for d in details if d.get("dedup_scope") == scope]
+    return sorted(rows, key=lambda d: (str(d.get("run_id")), int(d.get("id", 0))))
+
+
+def _latest_completed_run(scope: str) -> str | None:
+    runs = {d.get("run_id") for d in _dedup_runs_for_scope(scope)
+            if d.get("run_status") == RUN_COMPLETED}
+    return max(runs) if runs else None
+
+
+def _running_scopes() -> set[str]:
+    return {d.get("dedup_scope") for d in store.rows(DEDUP_DETAIL_TABLE)
+            if d.get("run_status") == RUN_RUNNING}
 
 
 class IngestPipeline:
@@ -292,65 +366,177 @@ class IngestPipeline:
         dedup_key_fields: list[str],
         window: str,
         retain_strategy: str = "keep_first",
+        batch_no: str | None = None,
     ) -> dict[str, Any]:
-        """对标准化明细执行去重。"""
-        dedup_strategies = store.rows("dedup_engine")
-        parsed = store.rows("parsed_entity")
+        """对标准化明细执行去重，并按判定范围生成去重明细。
 
-        # 构建去重策略
-        strategy_entry = {
-            "id": _next_id("dedup_engine"),
-            "策略名称": f"dedup-{_now_iso()}",
-            "去重键字段": ",".join(dedup_key_fields),
-            "去重窗口": window,
-            "保留策略": retain_strategy,
-            "生效数据源": "全部",
-            "status": "已生效",
-            "pending": False,
-            "abnormal": False,
-        }
-        dedup_strategies.append(strategy_entry)
+        - window=batch 时按「来源批次」拆分判定范围，同键日志只在本批内竞争，
+          两个批次的同键记录各留一条，不会互相淘汰；兼容历史批次编号。
+        - 每轮判定生成带 run_id 的去重明细（保留/淘汰/恢复），聚合视图只从
+          明细中的胜出记录取数。
+        - 保留策略改变后重跑时，上一轮被置换（淘汰）的记录会被恢复，历史明细
+          仍保留可查。
+        """
+        with _PIPELINE_LOCK:
+            dedup_strategies = store.rows("dedup_engine")
+            parsed = store.rows("parsed_entity")
+            details = store.rows(DEDUP_DETAIL_TABLE)
 
-        # 执行去重
-        seen: dict[str, int] = {}
-        duplicates = 0
-        for rec in parsed:
-            if rec.get("status") != "校验通过":
-                continue
-            fields_json = rec.get("标准化字段集", "{}")
-            try:
-                fields_data = json.loads(fields_json)
-            except (json.JSONDecodeError, TypeError):
-                fields_data = {}
-            key_parts = [str(fields_data.get(k, "")) for k in dedup_key_fields]
-            key = "||".join(key_parts)
-            if key in seen:
-                if retain_strategy == "keep_first":
-                    rec["status"] = "校验失败"
-                    rec["abnormal"] = True
-                    rec["dedup_id"] = str(seen[key])
-                    duplicates += 1
-                else:
-                    # keep_last：把旧记录标记为重复
-                    old = store.find("parsed_entity", seen[key])
-                    if old:
-                        old["status"] = "校验失败"
-                        old["abnormal"] = True
-                        old["dedup_id"] = str(rec["id"])
-                    rec["status"] = "校验通过"
-                    rec["dedup_id"] = ""
-                    seen[key] = rec["id"]
-            else:
-                seen[key] = rec["id"]
+            is_batch_window = str(window).strip().lower() == "batch"
+            # 兼容历史批次编号：只允许处理已经存在于标准化明细中的批次。
+            scopes = _dedup_scopes(window)
+            if is_batch_window and batch_no and batch_no not in scopes:
+                return {
+                    "ok": False,
+                    "message": f"批次 {batch_no} 没有可去重的校验通过明细",
+                    "strategy": "",
+                    "dedup_key_fields": dedup_key_fields,
+                    "duplicates_found": 0,
+                    "unique_keys": 0,
+                }
+            if is_batch_window and batch_no:
+                scopes = [batch_no]
 
-        return {
-            "ok": True,
-            "message": f"去重完成",
-            "strategy": strategy_entry["策略名称"],
-            "dedup_key_fields": dedup_key_fields,
-            "duplicates_found": duplicates,
-            "unique_keys": len(seen),
-        }
+            # 构建去重策略
+            strategy_entry = {
+                "id": _next_id("dedup_engine"),
+                "策略名称": f"dedup-{_now_iso()}",
+                "去重键字段": ",".join(dedup_key_fields),
+                "去重窗口": window,
+                "保留策略": retain_strategy,
+                "生效数据源": "全部",
+                "status": "已生效",
+                "pending": False,
+                "abnormal": False,
+            }
+            dedup_strategies.append(strategy_entry)
+
+            run_id = f"RUN-{_next_id(DEDUP_DETAIL_TABLE):05d}"
+            total_duplicates = 0
+            total_retained = 0
+            total_restored = 0
+            per_scope: dict[str, dict[str, Any]] = {}
+
+            for scope in scopes:
+                # 先恢复上一轮被本范围淘汰的记录：保留策略改变重跑时，旧淘汰者
+                # （当前因去重被置为校验失败）重新参与本轮判定，历史 run 明细保留可查。
+                prev_run = _latest_completed_run(scope)
+                prev_loser_ids: set[int] = set()
+                if prev_run:
+                    prev_loser_ids = {
+                        int(d.get("parsed_entity_id"))
+                        for d in _dedup_runs_for_scope(scope)
+                        if d.get("run_id") == prev_run
+                        and d.get("判定结果") == VERDICT_ELIMINATED
+                    }
+                    for rec in parsed:
+                        if (int(rec["id"]) in prev_loser_ids
+                                and (not is_batch_window
+                                     or str(rec.get("来源批次") or "") == scope)):
+                            rec["status"] = "校验通过"
+                            rec["校验状态"] = "校验通过"
+                            rec["abnormal"] = False
+                            rec["pending"] = False
+                            rec.pop("dedup_id", None)
+                            total_restored += 1
+
+                # 候选 = 本范围当前校验通过的记录（含刚恢复的旧淘汰者）。
+                # 真正质量校验失败的记录不会进入，去重只在合格记录间判定。
+                candidates = [
+                    rec for rec in parsed
+                    if rec.get("status") == "校验通过"
+                    and (not is_batch_window or str(rec.get("来源批次") or "") == scope)
+                ]
+                if not candidates:
+                    continue
+
+                # 先写入「运行中」占位明细：并发刷新时据此把该范围识别为仍在
+                # 变化的候选，不产出可消费统计。
+                for rec in candidates:
+                    details.append({
+                        "id": _next_id(DEDUP_DETAIL_TABLE),
+                        "run_id": run_id,
+                        "run_status": RUN_RUNNING,
+                        "dedup_scope": scope,
+                        "批次编号": scope if is_batch_window else "",
+                        "去重键字段": ",".join(dedup_key_fields),
+                        "dedup_key": _dedup_key(rec, dedup_key_fields),
+                        "parsed_entity_id": rec["id"],
+                        "来源批次": rec.get("来源批次", ""),
+                        "保留策略": retain_strategy,
+                        "判定结果": "",
+                        "胜出记录ID": "",
+                        "restored": int(rec["id"]) in prev_loser_ids,
+                        "strategy_name": strategy_entry["策略名称"],
+                        "created_at": _now_iso(),
+                    })
+
+                # 同键分组，组内按标准化明细 id 稳定排序，保证可重复判定。
+                groups: dict[str, list[dict[str, Any]]] = {}
+                for rec in candidates:
+                    groups.setdefault(_dedup_key(rec, dedup_key_fields), []).append(rec)
+                for members in groups.values():
+                    members.sort(key=lambda r: int(r.get("id", 0)))
+
+                scope_duplicates = 0
+                scope_retained = 0
+                run_details = [d for d in details if d.get("run_id") == run_id
+                               and d.get("dedup_scope") == scope]
+                detail_by_entity = {int(d["parsed_entity_id"]): d for d in run_details}
+
+                for key, members in groups.items():
+                    if retain_strategy == "keep_last":
+                        winner = members[-1]
+                    else:
+                        winner = members[0]
+                    for rec in members:
+                        detail = detail_by_entity[int(rec["id"])]
+                        if int(rec["id"]) == int(winner["id"]):
+                            rec["status"] = "校验通过"
+                            rec["校验状态"] = "校验通过"
+                            rec["abnormal"] = False
+                            rec["pending"] = False
+                            rec["dedup_id"] = ""
+                            detail["判定结果"] = VERDICT_RETAIN
+                            detail["胜出记录ID"] = str(winner["id"])
+                            scope_retained += 1
+                        else:
+                            rec["status"] = "校验失败"
+                            rec["校验状态"] = "去重淘汰"
+                            rec["abnormal"] = True
+                            rec["dedup_id"] = str(winner["id"])
+                            detail["判定结果"] = VERDICT_ELIMINATED
+                            detail["胜出记录ID"] = str(winner["id"])
+                            scope_duplicates += 1
+
+                # 本轮完成，占位明细转为已提交；聚合只读取已完成 run。
+                for detail in run_details:
+                    detail["run_status"] = RUN_COMPLETED
+                    detail["committed_at"] = _now_iso()
+
+                per_scope[scope] = {
+                    "candidates": len(candidates),
+                    "retained": scope_retained,
+                    "eliminated": scope_duplicates,
+                    "unique_keys": len(groups),
+                }
+                total_duplicates += scope_duplicates
+                total_retained += scope_retained
+
+            return {
+                "ok": True,
+                "message": "去重完成",
+                "strategy": strategy_entry["策略名称"],
+                "dedup_key_fields": dedup_key_fields,
+                "window": window,
+                "retain_strategy": retain_strategy,
+                "run_id": run_id,
+                "duplicates_found": total_duplicates,
+                "unique_keys": total_retained,
+                "retained": total_retained,
+                "restored": total_restored,
+                "scopes": per_scope,
+            }
 
     # ---------- 阶段4：校验 ----------
     def validate_entities(self, batch_no: str | None = None) -> dict[str, Any]:
@@ -401,6 +587,26 @@ class IngestPipeline:
             "quality_rule": active_rule.get("规则名称") if active_rule else None,
         }
 
+    def validate_and_dedup_batch(
+        self,
+        batch_no: str,
+        dedup_key_fields: list[str],
+        retain_strategy: str = "keep_first",
+        window: str = "batch",
+    ) -> dict[str, Any]:
+        """质量校验与按批去重在同一把锁内连续完成。
+
+        新批次的迟到日志常在「去重结束时刚通过质量校验」，把两步合成一个临界区，
+        并发刷新时外部只能看到「待判定候选」或「完整已提交 run」两种状态，
+        不会读到校验已过、判定未落的中间态。
+        """
+        with _PIPELINE_LOCK:
+            validation = self.validate_entities(batch_no)
+            dedup = self.run_dedup(
+                dedup_key_fields, window, retain_strategy, batch_no
+            )
+            return {"ok": True, "validation": validation, "dedup": dedup}
+
     # ---------- 阶段5：聚合视图刷新 ----------
     def refresh_aggregation(
         self,
@@ -408,56 +614,155 @@ class IngestPipeline:
         dim_field: str,
         metric_field: str,
         agg_func: str = "count",
+        batch_no: str | None = None,
     ) -> dict[str, Any]:
-        """基于标准化明细刷新聚合视图。"""
-        parsed = store.rows("parsed_entity")
-        results: dict[str, dict[str, Any]] = {}
+        """基于去重明细中的胜出日志刷新聚合视图。
 
-        for entity in parsed:
-            if entity.get("status") != "校验通过":
-                continue
-            try:
-                fields_data = json.loads(entity.get("标准化字段集", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                continue
+        - 聚合只统计去重明细里「已完成」run 判定为保留的记录，每批计数与该批
+          去重后应计条数一致；未经过去重的历史批次回退为直接读取校验通过明细。
+        - 去重仍在运行中的批次只作为「候选中」暴露，不计入可消费统计。
+        - 每次刷新生成不可变快照版本；刷新与去重并发时，已发布的统计只包含
+          同一批的完整判定结果，不会混用两次判定。
+        """
+        with _PIPELINE_LOCK:
+            parsed = store.rows("parsed_entity")
+            entities_by_id = {int(rec["id"]): rec for rec in parsed}
+            details = store.rows(DEDUP_DETAIL_TABLE)
+            running = _running_scopes()
 
-            dim_val = str(fields_data.get(dim_field, "unknown"))
-            metric_val = fields_data.get(metric_field, "0")
+            # 已提交去重 run 覆盖的批次（global 窗口统一记在 global 范围）。
+            scoped_batches = {
+                str(d.get("批次编号") or "")
+                for d in details
+                if d.get("run_status") == RUN_COMPLETED and d.get("批次编号")
+            }
+            global_runs = [
+                d for d in details
+                if d.get("run_status") == RUN_COMPLETED
+                and d.get("dedup_scope") == GLOBAL_DEDUP_SCOPE
+            ]
 
-            if dim_val not in results:
-                results[dim_val] = {"count": 0, "sum": 0.0, "values": []}
+            def _winner_ids_for_batch(scope_batch: str) -> set[int]:
+                """取某批次在最新已完成 run 中的胜出记录 id。"""
+                run_id = _latest_completed_run(scope_batch)
+                if run_id is None:
+                    return set()
+                return {
+                    int(d["parsed_entity_id"])
+                    for d in _dedup_runs_for_scope(scope_batch)
+                    if d.get("run_id") == run_id and d.get("判定结果") == VERDICT_RETAIN
+                }
 
-            results[dim_val]["count"] += 1
-            try:
-                results[dim_val]["sum"] += float(metric_val) if metric_val else 0.0
-            except (ValueError, TypeError):
-                pass
-            results[dim_val]["values"].append(metric_val)
+            # 枚举参与本次刷新的批次。
+            all_batches = sorted({
+                str(rec.get("来源批次") or "")
+                for rec in parsed if rec.get("来源批次")
+            })
+            target_batches = [batch_no] if batch_no else all_batches
 
-        # 创建/更新聚合视图
-        aggs = store.rows("aggregation_view")
-        agg_entry = {
-            "id": _next_id("aggregation_view"),
-            "视图名称": view_name,
-            "聚合维度": dim_field,
-            "指标定义": f"{agg_func}({metric_field})",
-            "数据源范围": "标准化明细",
-            "刷新间隔": "manual",
-            "status": "已生效",
-            "pending": False,
-            "abnormal": False,
-            "results": results,
-            "refreshed_at": _now_iso(),
-            "source_records": len(parsed),
-        }
-        aggs.append(agg_entry)
+            results: dict[str, dict[str, Any]] = {}
+            candidate_batches: list[str] = []
+            stable_batches: list[str] = []
+            consumed_runs: dict[str, str] = {}
+            consumed_count = 0
 
-        return {
-            "ok": True,
-            "message": f"聚合视图 {view_name} 已刷新",
-            "view": agg_entry,
-            "dimensions": len(results),
-        }
+            for scope_batch in target_batches:
+                if scope_batch in running:
+                    # 去重尚未提交：该批仍是变化中的候选，不进入可消费统计。
+                    candidate_batches.append(scope_batch)
+                    continue
+
+                if scope_batch in scoped_batches:
+                    # 按批去重：只读取最新已完成 run 的胜出明细。
+                    winner_ids = _winner_ids_for_batch(scope_batch)
+                    run_id = _latest_completed_run(scope_batch)
+                    if run_id:
+                        consumed_runs[scope_batch] = run_id
+                    source_entities = [
+                        entities_by_id[eid] for eid in winner_ids
+                        if eid in entities_by_id
+                    ]
+                    stable_batches.append(scope_batch)
+                elif global_runs:
+                    # 全局窗口去重：从全局 run 的胜出者中筛本批记录。
+                    run_id = max({d["run_id"] for d in global_runs})
+                    winner_ids = {
+                        int(d["parsed_entity_id"])
+                        for d in global_runs
+                        if d.get("run_id") == run_id and d.get("判定结果") == VERDICT_RETAIN
+                    }
+                    consumed_runs[scope_batch] = run_id
+                    source_entities = [
+                        entities_by_id[eid] for eid in winner_ids
+                        if eid in entities_by_id
+                        and str(entities_by_id[eid].get("来源批次") or "") == scope_batch
+                    ]
+                    stable_batches.append(scope_batch)
+                else:
+                    # 历史批次未经过去重：沿用批次取数逻辑直接消费校验通过明细。
+                    source_entities = [
+                        rec for rec in parsed
+                        if str(rec.get("来源批次") or "") == scope_batch
+                        and rec.get("status") == "校验通过"
+                    ]
+
+                for entity in source_entities:
+                    fields_data = _load_fields(entity)
+                    dim_val = str(fields_data.get(dim_field, "unknown"))
+                    metric_val = fields_data.get(metric_field, "0")
+                    bucket = results.setdefault(dim_val, {"count": 0, "sum": 0.0, "values": []})
+                    bucket["count"] += 1
+                    try:
+                        bucket["sum"] += float(metric_val) if metric_val else 0.0
+                    except (ValueError, TypeError):
+                        pass
+                    bucket["values"].append(metric_val)
+                    consumed_count += 1
+
+            is_stable = not candidate_batches
+            snapshot = copy.deepcopy(results)
+            aggs = store.rows("aggregation_view")
+            version = sum(1 for a in aggs if a.get("视图名称") == view_name) + 1
+            agg_entry = {
+                "id": _next_id("aggregation_view"),
+                "视图名称": view_name,
+                "聚合维度": dim_field,
+                "指标定义": f"{agg_func}({metric_field})",
+                "数据源范围": "去重明细" if (scoped_batches or global_runs) else "标准化明细",
+                "刷新间隔": "manual",
+                "status": "已生效",
+                "pending": False,
+                "abnormal": False,
+                "results": snapshot,
+                "refreshed_at": _now_iso(),
+                "source_records": consumed_count,
+                # 并发与版本控制所需元数据。
+                "snapshot_version": version,
+                "view_status": VIEW_CONSUMABLE if is_stable else VIEW_CANDIDATE,
+                "batch_no": batch_no or "",
+                "stable_batches": json.dumps(stable_batches, ensure_ascii=False),
+                "candidate_batches": json.dumps(candidate_batches, ensure_ascii=False),
+                "consumed_runs": json.dumps(consumed_runs, ensure_ascii=False),
+                "immutable": True,
+            }
+            aggs.append(agg_entry)
+
+            return {
+                "ok": True,
+                "message": (
+                    f"聚合视图 {view_name} 已刷新"
+                    if is_stable
+                    else f"聚合视图 {view_name} 含候选批次，候选未计入可消费统计"
+                ),
+                "view": agg_entry,
+                "dimensions": len(results),
+                "view_status": agg_entry["view_status"],
+                "snapshot_version": version,
+                "consumed_count": consumed_count,
+                "stable_batches": stable_batches,
+                "candidate_batches": candidate_batches,
+                "consumed_runs": consumed_runs,
+            }
 
     # ---------- 阶段6：数据导出 ----------
     def build_export(
@@ -685,12 +990,12 @@ class IngestPipeline:
         valid_result = self.validate_entities(batch_no)
         steps["validate"] = valid_result
 
-        # S4: 去重
-        dedup_result = self.run_dedup(["time", "level"], "batch", "keep_first")
+        # S4: 去重（按当前批次取数，不与历史批次互相淘汰）
+        dedup_result = self.run_dedup(["time", "level"], "batch", "keep_first", batch_no)
         steps["dedup"] = dedup_result
 
-        # S5: 聚合
-        agg_result = self.refresh_aggregation(f"view-{batch_no}", "level", "time", "count")
+        # S5: 聚合（只从本批去重明细的胜出记录取数）
+        agg_result = self.refresh_aggregation(f"view-{batch_no}", "level", "time", "count", batch_no)
         steps["aggregation"] = agg_result
 
         # S6: 导出
